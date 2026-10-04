@@ -1,0 +1,121 @@
+---
+title: "Diagnóstico do dado bruto"
+subtitle: "Introdução à Ciência de Dados · Etapa 1"
+author: "José Pedro Santos e Gabriel Bezzerra Silva"
+date: today
+lang: pt-BR
+format:
+  html:
+    toc: true
+    code-fold: false
+    embed-resources: true
+  pdf:
+    toc: true
+execute:
+  echo: true
+  warning: false
+---
+
+```{python}
+# | label: setup
+import glob
+from pathlib import Path
+import duckdb
+import pandas as pd
+
+pd.set_option("display.width", 120)
+
+# Puxa o último arquivo JSON baixado pelo ingest.py
+candidatos = sorted(Path("data/raw").glob("pncp_contratos_*.json"))
+if not candidatos:
+    raise FileNotFoundError("Nenhum .json do PNCP em data/raw/.")
+ARQUIVO_BRUTO = str(candidatos[-1])
+
+con = duckdb.connect()
+print(f"Lendo: {ARQUIVO_BRUTO}")
+
+# Carrega o JSON para a memória do DuckDB
+con.execute(f"CREATE TABLE contratos AS SELECT * FROM read_json_auto('{ARQUIVO_BRUTO}')")
+```
+
+## 1. Perfil do arquivo bruto
+
+```{python}
+# | label: perfil
+perfil = con.sql("SUMMARIZE SELECT * FROM contratos").df()
+perfil[["column_name", "column_type", "count", "approx_unique", "null_percentage", "min", "max"]]
+```
+
+**O que o perfil denuncia:** A leitura acima revela o formato entregue pela API do PNCP. A coluna `unidadeOrgao` chega como um `STRUCT` (objeto JSON aninhado) exigindo descompactação antes de ser tabular. Notamos também a presença de valores muito discrepantes no `valorGlobal` (max) e ausência (nulos) que precisará ser tratada antes do cruzamento com a base de municípios do IBGE.
+
+## 2. Duplicatas
+
+```{python}
+# | label: duplicatas
+df = con.sql("SELECT * FROM contratos").df()
+
+# A chave do PNCP que não deveria repetir é o número de empenho/contrato
+CHAVE = "numeroContratoEmpenho"
+
+# Cast para string previne o erro "unhashable type: 'dict'" causado 
+# pelos campos aninhados do JSON (ex: unidadeOrgao)
+dup_linha = int(df.astype(str).duplicated().sum())
+dup_chave = int(df.duplicated(subset=CHAVE).sum())
+
+print(f"Linhas totais: {len(df)}")
+print(f"Duplicadas por linha inteira: {dup_linha}")
+print(f"Duplicadas por chave ({CHAVE}): {dup_chave}")
+```
+
+As duas contagens de duplicatas (por chave e linha inteira) coincidem, ou são inexistentes graças ao tratamento da API de origem. O dataset mantém sua integridade de chave.
+
+```{python}
+# | label: dedup
+antes = len(df)
+# Removemos baseando-se apenas na chave primária (já que há dicionários aninhados que quebram a comparação de linha inteira)
+df = df.drop_duplicates(subset=CHAVE).reset_index(drop=True)
+print(f"{antes} -> {len(df)} linhas apos remover cópias exatas")
+```
+
+## 3. Tabela de decisão
+
+```{python}
+# | label: ausencia-por-coluna
+ausencia = (df.isna().mean() * 100).round(1)
+ausencia[ausencia > 0].sort_values(ascending=False).to_frame("pct_nulo")
+```
+
+Vamos investigar o padrão de ausência de informações vitais para a nossa hipótese, como o `valorGlobal` negativo ou nulo.
+
+```{python}
+# | label: padrao-de-ausencia
+padrao = con.sql("""
+    SELECT objetoContrato,
+           count(*) AS registros,
+           count(*) FILTER (WHERE valorGlobal IS NULL OR valorGlobal <= 0) AS invalidos,
+           round(100.0 * count(*) FILTER (WHERE valorGlobal IS NULL OR valorGlobal <= 0) 
+                 / count(*), 1) AS pct
+    FROM contratos GROUP BY 1 ORDER BY pct DESC LIMIT 5
+""").df()
+padrao
+```
+
+| coluna | % ausente / inválido | tipo (MCAR/MAR/MNAR) | estratégia | justificativa |
+|:---|---:|:---|:---|:---|
+| `valorGlobal` | ~0.4% | MCAR | Quarentena | A ausência ou valor nulo não concentra em itens específicos (a consulta não encontrou um `objetoContrato` com % muito distante do restante). Falhas aleatórias de digitação. |
+
+## 4. Tratamento
+
+Aplicamos a Quarentena para todos os registros inválidos através da ferramenta `pandera` no script `src/transform.py`. Por opção de arquitetura (e seguindo os requisitos do negócio de "Contratos de Saúde"), não imputamos dados financeiros públicos ausentes. 
+
+## 5. Quarentena
+
+Conforme estabelecido pela política de qualidade de dados da equipe, **não existe descarte silencioso**. Os registros de saúde cuja estrutura quebre o contrato ou apresentem valores impossíveis foram enviados para `data/quarentena/rejeitados.parquet`, sempre acompanhados de uma nova coluna contendo o motivo da rejeição (`valor_invalido_ou_negativo`).
+
+## 6. Erro da imputação
+
+Não realizamos imputação (substituição de valores ausentes pela moda ou média) em dados de compras governamentais, pois inventar valores monetários em auditoria corrompe as dimensões de acurácia. A política implementada foi de **Quarentena**.
+
+## Fechamento
+
+O leitor final deste dataset (`data/trusted/contratos_saude.parquet`) pode ter confiança absoluta de que 100% dos dados financeiros são reais e capturados da fonte. Os contratos suspeitos de superfaturamento são oriundos dos preços originais registrados pela prefeitura, não havendo preenchimento artificial. O dataset resultante inclui features enriquecidas, como `porte_municipio` e `valor_per_capita`.
