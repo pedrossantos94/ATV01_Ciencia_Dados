@@ -1,0 +1,28 @@
+[project]
+name = "atv-01"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "José Pedro Santos", email = "pedrossantos94@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "duckdb>=1.5.6",
+    "pandas>=3.0.6",
+    "pandera>=0.33.1",
+    "pyarrow>=25.0.1",
+]
+
+[project.scripts]
+atv-01 = "atv_01:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "jupyter>=1.1.1",
+    "missingno>=0.5.2",
+]
